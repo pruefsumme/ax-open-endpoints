@@ -173,11 +173,30 @@ spec:
 ```
 
 Providers that use a different HTTP protocol need a protocol adapter in
-`internal/model/provider.go`. The current `Generate` interface handles one
-text response at a time; it does not execute tool calls or stream tokens. The
-client returns HTTP and timeout errors without retrying automatically. An
-application can decide when it is safe to repeat a request after an ambiguous
-network failure.
+`internal/model/provider.go`. AX supports text and function-call responses for
+OpenAI-compatible and Anthropic protocols. The built-in workspace goal agent
+uses one bounded `run_command` tool loop with those protocols. It does not
+stream tokens or accept multimodal input.
+
+The OpenAI-compatible and Anthropic clients retry explicit `429`, `502`, `503`,
+and `504` responses up to two times, honoring `Retry-After` up to five seconds.
+They do not retry network timeouts because a provider may have completed the
+request before the connection failed.
+
+The atespace's `default-model` is supplied to every task container as
+`AX_MODEL_YAML` and `AX_MODEL_API_KEY`; OpenAI and Anthropic protocol settings
+also populate the matching standard environment variables. The task's own
+command can use these values with its agent library. A command running in that
+container can read the configured API key, so use a separate atespace for
+workloads that should not share model credentials.
+
+For a `Workspace` goal, OpenAI-compatible and Anthropic Models use AX's generic
+bootstrap. A native Google Model keeps Antigravity. To use the configured Gemini
+model with the generic bootstrap, set `protocol: openai` and use Google's
+OpenAI-compatible base URL, `https://generativelanguage.googleapis.com/v1beta/openai/`.
+The `run_command` tool starts in the workspace directory, but shell commands are
+not restricted to that path; the task container is the isolation boundary. The
+task Gateway must allow egress to the selected provider host on port 443.
 
 ### Google Gemini
 

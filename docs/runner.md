@@ -17,11 +17,16 @@ The controller does not run `spec.command` as the container entrypoint. It alway
 | `AX_TASK_YAML` | The `Task` launch configuration as YAML, excluding status and the suspend flag |
 | `AX_WORKSPACES_YAML` | Every bound `Workspace` resource as a multi-document YAML stream, in the task's binding order |
 | `spec.env` entries | Each one set directly in the container environment |
-| `GEMINI_API_KEY` | Set when the atespace has a Gemini credential configured |
+| `AX_MODEL_YAML` | The atespace's `default-model`, when configured |
+| `AX_MODEL_API_KEY` | Its API key, resolved from the referenced Secret |
+| `AX_MODEL_PROVIDER`, `AX_MODEL_PROTOCOL`, `AX_MODEL`, `AX_MODEL_BASE_URL` | The selected provider configuration |
+| `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_BASE_URL` | Set for OpenAI-compatible Models |
+| `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `ANTHROPIC_BASE_URL` | Set for Anthropic Models |
+| `GEMINI_API_KEY`, `GEMINI_MODEL` | Set for Google Models |
 | Volume | A durable directory mounted at `/workspace` |
 | Readiness probe | `GET /readyz` on port 80 |
 
-Two consequences follow from that table. Your image must contain an executable at `/usr/local/bin/ax-task-runner`, even if it is a symlink or a shell wrapper around something else. And `spec.command` reaches the runner only through `AX_TASK_YAML`; the runner is responsible for parsing it and starting it.
+Two consequences follow from that table. Your image must contain an executable at `/usr/local/bin/ax-task-runner`, even if it is a symlink or a shell wrapper around something else. And `spec.command` reaches the runner only through `AX_TASK_YAML`; the runner is responsible for parsing it and starting it. The default Model key is available to the task command, so use an atespace whose workloads you trust with that credential.
 
 The `/workspace` volume is what survives suspend and resume. Agent Substrate snapshots it when a task is suspended and restores it into a fresh container when the task is resumed, so the runner will see the same files but a new process tree.
 
