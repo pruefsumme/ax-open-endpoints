@@ -594,7 +594,16 @@ func runDescribe(serverURL, atespace string, args []string) error {
 		fmt.Printf("Atespace:           %s\n", mAtespace)
 		if m.Spec != nil {
 			fmt.Printf("Provider:           %s\n", m.Spec.Provider)
+			if m.Spec.Protocol != "" {
+				fmt.Printf("Protocol:           %s\n", m.Spec.Protocol)
+			}
 			fmt.Printf("Model:              %s\n", m.Spec.Model)
+			if m.Spec.BaseUrl != "" {
+				fmt.Printf("Base URL:           %s\n", m.Spec.BaseUrl)
+			}
+			if m.Spec.ApiKeyHeader != "" {
+				fmt.Printf("API key header:     %s\n", m.Spec.ApiKeyHeader)
+			}
 			if params := m.Spec.GetParameters().AsMap(); len(params) > 0 {
 				fmt.Println("Parameters:")
 				keys := make([]string, 0, len(params))

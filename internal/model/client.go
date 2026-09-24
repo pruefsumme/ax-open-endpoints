@@ -35,9 +35,12 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
-// Supported providers and default models
+// Default model settings.
 const (
-	ProviderGoogle = "google"
+	ProviderGoogle    = "google"
+	ProtocolOpenAI    = "openai"
+	ProtocolAnthropic = "anthropic"
+	ProtocolGoogle    = "google"
 
 	DefaultModel             = "gemini-3.8-flash"
 	DefaultModelResourceName = "default-model"
@@ -60,16 +63,20 @@ type Config struct {
 	Name     string `json:"name,omitempty" yaml:"name,omitempty"`
 	Atespace string `json:"atespace,omitempty" yaml:"atespace,omitempty"`
 	Provider string `json:"provider" yaml:"provider"`
+	Protocol string `json:"protocol,omitempty" yaml:"protocol,omitempty"`
 	Model    string `json:"model,omitempty" yaml:"model,omitempty"`
 	// Parameters are provider-specific generation settings passed through to the
 	// model API, for example temperature or maxOutputTokens for Gemini. A
 	// systemInstruction entry is sent as the system instruction rather than as a
 	// generation parameter.
-	Parameters    map[string]any `json:"parameters,omitempty" yaml:"parameters,omitempty"`
-	SecretKey     *SecretKeyRef  `json:"secretKey,omitempty" yaml:"secretKey,omitempty"`
-	APIKey        string         `json:"apiKey,omitempty" yaml:"apiKey,omitempty"`
-	BaseURL       string         `json:"baseURL,omitempty" yaml:"baseURL,omitempty"`
-	DisableRemote bool           `json:"disableRemote,omitempty" yaml:"disableRemote,omitempty"`
+	Parameters    map[string]any    `json:"parameters,omitempty" yaml:"parameters,omitempty"`
+	SecretKey     *SecretKeyRef     `json:"secretKey,omitempty" yaml:"secretKey,omitempty"`
+	APIKey        string            `json:"apiKey,omitempty" yaml:"apiKey,omitempty"`
+	BaseURL       string            `json:"baseURL,omitempty" yaml:"baseURL,omitempty"`
+	Headers       map[string]string `json:"headers,omitempty" yaml:"headers,omitempty"`
+	APIKeyHeader  string            `json:"apiKeyHeader,omitempty" yaml:"apiKeyHeader,omitempty"`
+	APIKeyPrefix  string            `json:"apiKeyPrefix,omitempty" yaml:"apiKeyPrefix,omitempty"`
+	DisableRemote bool              `json:"disableRemote,omitempty" yaml:"disableRemote,omitempty"`
 }
 
 // ConfigFromSpec creates a Config from a v1alpha1.ModelSpec.
@@ -78,20 +85,53 @@ func ConfigFromSpec(spec *v1alpha1.ModelSpec) Config {
 		return DefaultConfig()
 	}
 	secKey := spec.SecretKey
-	if secKey == nil {
+	if secKey == nil && protocolFor(spec.Provider, spec.Protocol) == ProtocolGoogle {
 		secKey = &SecretKeyRef{
 			Name: DefaultSecretName,
 			Key:  DefaultSecretKey,
 		}
 	}
 	return Config{
-		Name:       DefaultModelResourceName,
-		Atespace:   DefaultAtespace,
-		Provider:   spec.Provider,
-		Model:      spec.Model,
-		Parameters: spec.GetParameters().AsMap(),
-		SecretKey:  secKey,
+		Name:         DefaultModelResourceName,
+		Atespace:     DefaultAtespace,
+		Provider:     spec.Provider,
+		Protocol:     spec.Protocol,
+		Model:        spec.Model,
+		Parameters:   spec.GetParameters().AsMap(),
+		SecretKey:    secKey,
+		BaseURL:      spec.GetBaseUrl(),
+		Headers:      cloneHeaders(spec.GetHeaders()),
+		APIKeyHeader: spec.GetApiKeyHeader(),
+		APIKeyPrefix: spec.GetApiKeyPrefix(),
 	}
+}
+
+// protocolFor keeps familiar provider names working while allowing users to
+// point any OpenAI-compatible provider at its own endpoint.
+func protocolFor(provider, protocol string) string {
+	if protocol = strings.ToLower(strings.TrimSpace(protocol)); protocol != "" {
+		return protocol
+	}
+
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "", ProviderGoogle:
+		return ProtocolGoogle
+	case ProtocolAnthropic:
+		return ProtocolAnthropic
+	default:
+		return ProtocolOpenAI
+	}
+}
+
+func cloneHeaders(headers map[string]string) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	copy := make(map[string]string, len(headers))
+	for name, value := range headers {
+		copy[name] = value
+	}
+	return copy
 }
 
 // ConfigFromCRD creates a Config from a v1alpha1.Model resource.
@@ -242,7 +282,7 @@ func NewClient(cfg Config, opts ...Option) *Client {
 	if cfg.Provider == "" {
 		cfg.Provider = ProviderGoogle
 	}
-	if cfg.SecretKey == nil && (cfg.Name == DefaultModelResourceName || cfg.Name == "") {
+	if cfg.SecretKey == nil && protocolFor(cfg.Provider, cfg.Protocol) == ProtocolGoogle {
 		cfg.SecretKey = &SecretKeyRef{
 			Name: DefaultSecretName,
 			Key:  DefaultSecretKey,
@@ -442,9 +482,14 @@ func (c *Client) Config() Config {
 // Spec converts the client configuration to a v1alpha1.ModelSpec.
 func (c *Client) Spec() *v1alpha1.ModelSpec {
 	spec := &v1alpha1.ModelSpec{
-		Provider:  c.cfg.Provider,
-		Model:     c.cfg.Model,
-		SecretKey: c.cfg.SecretKey,
+		Provider:     c.cfg.Provider,
+		Protocol:     c.cfg.Protocol,
+		Model:        c.cfg.Model,
+		SecretKey:    c.cfg.SecretKey,
+		BaseUrl:      c.cfg.BaseURL,
+		Headers:      cloneHeaders(c.cfg.Headers),
+		ApiKeyHeader: c.cfg.APIKeyHeader,
+		ApiKeyPrefix: c.cfg.APIKeyPrefix,
 	}
 	if len(c.cfg.Parameters) > 0 {
 		// Values that cannot be represented in a Struct (only JSON-like types can)

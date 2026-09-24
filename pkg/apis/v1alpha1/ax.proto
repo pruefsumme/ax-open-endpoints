@@ -254,6 +254,21 @@ message ModelSpec {
   // parameters are provider-specific generation settings passed through to the
   // model API as-is, for example temperature or maxOutputTokens for Gemini.
   google.protobuf.Struct parameters = 7;
+  // protocol selects the request format independently of the provider name.
+  // Supported values are "openai", "anthropic", and "google". When omitted,
+  // AX infers Google and Anthropic from provider and uses OpenAI-compatible
+  // chat completions for every other provider name.
+  string protocol = 8;
+  // base_url is the API base URL, including any version path such as /v1.
+  // AX adds the protocol's request path unless the full path is already present.
+  string base_url = 9 [json_name = "baseURL"];
+  // headers adds non-secret headers to each request, for example OpenRouter
+  // attribution headers. Use secret_key for credentials instead.
+  map<string, string> headers = 10;
+  // api_key_header and api_key_prefix override the protocol's default API-key
+  // authentication. A custom header defaults to no prefix.
+  string api_key_header = 11;
+  string api_key_prefix = 12;
 }
 
 message SecretKeyRef {
@@ -384,4 +399,3 @@ message DeleteModelRequest {
 }
 
 message DeleteModelResponse {}
-
