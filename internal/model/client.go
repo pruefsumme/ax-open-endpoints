@@ -170,18 +170,44 @@ func DefaultConfig() Config {
 
 // GenerateRequest specifies the input for model inference.
 type GenerateRequest struct {
-	Model             string  `json:"model,omitempty"`
-	Prompt            string  `json:"prompt"`
-	SystemInstruction string  `json:"systemInstruction,omitempty"`
-	Temperature       float64 `json:"temperature,omitempty"`
-	MaxTokens         int     `json:"maxTokens,omitempty"`
+	Model             string           `json:"model,omitempty"`
+	Prompt            string           `json:"prompt"`
+	SystemInstruction string           `json:"systemInstruction,omitempty"`
+	Temperature       float64          `json:"temperature,omitempty"`
+	MaxTokens         int              `json:"maxTokens,omitempty"`
+	Messages          []Message        `json:"messages,omitempty"`
+	Tools             []ToolDefinition `json:"tools,omitempty"`
+}
+
+// Message is one item in a provider-neutral text and tool conversation.
+type Message struct {
+	Role       string     `json:"role"`
+	Content    string     `json:"content,omitempty"`
+	ToolCallID string     `json:"toolCallId,omitempty"`
+	ToolName   string     `json:"toolName,omitempty"`
+	ToolCalls  []ToolCall `json:"toolCalls,omitempty"`
+}
+
+// ToolDefinition describes a function the model may ask the caller to execute.
+type ToolDefinition struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters"`
+}
+
+// ToolCall is a provider's request for the caller to execute a function.
+type ToolCall struct {
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
 }
 
 // GenerateResponse holds the completion output and token statistics.
 type GenerateResponse struct {
-	Model   string     `json:"model"`
-	Content string     `json:"content"`
-	Usage   UsageStats `json:"usage"`
+	Model     string     `json:"model"`
+	Content   string     `json:"content"`
+	ToolCalls []ToolCall `json:"toolCalls,omitempty"`
+	Usage     UsageStats `json:"usage"`
 }
 
 // UsageStats provides token counts for the inference call.
@@ -516,6 +542,9 @@ func (c *Client) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 	if req == nil {
 		return nil, fmt.Errorf("request cannot be nil")
 	}
+	if req.Prompt == "" && len(req.Messages) == 0 {
+		return nil, fmt.Errorf("prompt or messages must be set")
+	}
 
 	modelName := req.Model
 	if modelName == "" {
@@ -541,6 +570,8 @@ func (c *Client) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 		SystemInstruction: sysInst,
 		Temperature:       req.Temperature,
 		MaxTokens:         req.MaxTokens,
+		Messages:          append([]Message(nil), req.Messages...),
+		Tools:             append([]ToolDefinition(nil), req.Tools...),
 	}
 
 	if c.cfg.DisableRemote {
@@ -561,6 +592,9 @@ func (c *Client) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 
 // generateGoogle communicates with Google Generative Language API for Gemini models.
 func (c *Client) generateGoogle(ctx context.Context, req *GenerateRequest) (*GenerateResponse, error) {
+	if len(req.Messages) > 0 || len(req.Tools) > 0 {
+		return nil, fmt.Errorf("native Google API does not use AX's OpenAI-style message and tool format; use protocol: openai for the Gemini compatibility endpoint")
+	}
 	if c.cfg.DisableRemote || c.cfg.APIKey == "" {
 		return c.fallbackResponse(req), nil
 	}

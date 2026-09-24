@@ -22,7 +22,14 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
+)
+
+const (
+	maxProviderRetries = 2
+	maxRetryDelay      = 5 * time.Second
 )
 
 // providerAdapter translates AX's small text-generation request into one
@@ -63,7 +70,10 @@ func (openAIAdapter) Generate(ctx context.Context, client *Client, req *Generate
 	moveParameter(parameters, "maxTokens", "max_tokens")
 	moveParameter(parameters, "maxOutputTokens", "max_tokens")
 	parameters["model"] = req.Model
-	parameters["messages"] = promptMessages(req)
+	parameters["messages"] = openAIMessages(req)
+	if len(req.Tools) > 0 {
+		parameters["tools"] = openAITools(req.Tools)
+	}
 	if req.Temperature > 0 {
 		parameters["temperature"] = req.Temperature
 	}
@@ -86,7 +96,13 @@ func (openAIAdapter) Generate(ctx context.Context, client *Client, req *Generate
 			FinishReason string `json:"finish_reason"`
 			Message      struct {
 				Content   json.RawMessage `json:"content"`
-				ToolCalls json.RawMessage `json:"tool_calls"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
 			} `json:"message"`
 		} `json:"choices"`
 		Usage struct {
@@ -103,14 +119,26 @@ func (openAIAdapter) Generate(ctx context.Context, client *Client, req *Generate
 	}
 
 	choice := completion.Choices[0]
-	if hasJSONValue(choice.Message.ToolCalls) || choice.FinishReason == "tool_calls" {
-		return nil, fmt.Errorf("%s returned tool calls, but AX Generate only supports text responses", client.cfg.Provider)
+	toolCalls := make([]ToolCall, 0, len(choice.Message.ToolCalls))
+	for _, call := range choice.Message.ToolCalls {
+		arguments := json.RawMessage(call.Function.Arguments)
+		if len(arguments) == 0 {
+			arguments = json.RawMessage("{}")
+		}
+		if !json.Valid(arguments) {
+			return nil, fmt.Errorf("%s returned invalid JSON arguments for tool %q", client.cfg.Provider, call.Function.Name)
+		}
+		toolCalls = append(toolCalls, ToolCall{
+			ID:        call.ID,
+			Name:      call.Function.Name,
+			Arguments: arguments,
+		})
 	}
 	content, err := responseText(choice.Message.Content)
 	if err != nil {
 		return nil, fmt.Errorf("reading %s response text: %w", client.cfg.Provider, err)
 	}
-	if content == "" {
+	if content == "" && len(toolCalls) == 0 {
 		return nil, fmt.Errorf("%s returned no text content (finish reason %q)", client.cfg.Provider, choice.FinishReason)
 	}
 
@@ -123,8 +151,9 @@ func (openAIAdapter) Generate(ctx context.Context, client *Client, req *Generate
 		totalTokens = completion.Usage.PromptTokens + completion.Usage.CompletionTokens
 	}
 	return &GenerateResponse{
-		Model:   modelName,
-		Content: content,
+		Model:     modelName,
+		Content:   content,
+		ToolCalls: toolCalls,
 		Usage: UsageStats{
 			PromptTokens:     completion.Usage.PromptTokens,
 			CompletionTokens: completion.Usage.CompletionTokens,
@@ -146,13 +175,17 @@ func (anthropicAdapter) Generate(ctx context.Context, client *Client, req *Gener
 	moveParameter(parameters, "maxTokens", "max_tokens")
 	moveParameter(parameters, "maxOutputTokens", "max_tokens")
 	parameters["model"] = req.Model
-	parameters["messages"] = []map[string]string{{"role": "user", "content": req.Prompt}}
+	system, messages := anthropicMessages(req)
+	parameters["messages"] = messages
+	if system != "" {
+		parameters["system"] = system
+	}
+	if len(req.Tools) > 0 {
+		parameters["tools"] = anthropicTools(req.Tools)
+	}
 	if _, ok := parameters["max_tokens"]; !ok {
 		// Anthropic requires this field even when the caller leaves AX's cap unset.
 		parameters["max_tokens"] = 1024
-	}
-	if req.SystemInstruction != "" {
-		parameters["system"] = req.SystemInstruction
 	}
 	if req.Temperature > 0 {
 		parameters["temperature"] = req.Temperature
@@ -174,8 +207,11 @@ func (anthropicAdapter) Generate(ctx context.Context, client *Client, req *Gener
 		Model      string `json:"model"`
 		StopReason string `json:"stop_reason"`
 		Content    []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
+			Type  string          `json:"type"`
+			Text  string          `json:"text"`
+			ID    string          `json:"id"`
+			Name  string          `json:"name"`
+			Input json.RawMessage `json:"input"`
 		} `json:"content"`
 		Usage struct {
 			InputTokens  int `json:"input_tokens"`
@@ -187,15 +223,23 @@ func (anthropicAdapter) Generate(ctx context.Context, client *Client, req *Gener
 	}
 
 	var content strings.Builder
+	toolCalls := make([]ToolCall, 0)
 	for _, block := range message.Content {
-		if block.Type == "text" {
+		switch block.Type {
+		case "text":
 			content.WriteString(block.Text)
+		case "tool_use":
+			arguments := block.Input
+			if len(arguments) == 0 {
+				arguments = json.RawMessage("{}")
+			}
+			if !json.Valid(arguments) {
+				return nil, fmt.Errorf("Anthropic returned invalid JSON arguments for tool %q", block.Name)
+			}
+			toolCalls = append(toolCalls, ToolCall{ID: block.ID, Name: block.Name, Arguments: arguments})
 		}
 	}
-	if content.Len() == 0 {
-		if message.StopReason == "tool_use" {
-			return nil, fmt.Errorf("Anthropic returned tool use, but AX Generate only supports text responses")
-		}
+	if content.Len() == 0 && len(toolCalls) == 0 {
 		return nil, fmt.Errorf("Anthropic returned no text content (stop reason %q)", message.StopReason)
 	}
 	modelName := message.Model
@@ -203,8 +247,9 @@ func (anthropicAdapter) Generate(ctx context.Context, client *Client, req *Gener
 		modelName = req.Model
 	}
 	return &GenerateResponse{
-		Model:   modelName,
-		Content: content.String(),
+		Model:     modelName,
+		Content:   content.String(),
+		ToolCalls: toolCalls,
 		Usage: UsageStats{
 			PromptTokens:     message.Usage.InputTokens,
 			CompletionTokens: message.Usage.OutputTokens,
@@ -213,13 +258,160 @@ func (anthropicAdapter) Generate(ctx context.Context, client *Client, req *Gener
 	}, nil
 }
 
-func promptMessages(req *GenerateRequest) []map[string]string {
-	messages := make([]map[string]string, 0, 2)
-	if req.SystemInstruction != "" {
-		messages = append(messages, map[string]string{"role": "system", "content": req.SystemInstruction})
+func requestMessages(req *GenerateRequest) []Message {
+	if len(req.Messages) > 0 {
+		messages := append([]Message(nil), req.Messages...)
+		if req.SystemInstruction != "" {
+			for i := range messages {
+				message := &messages[i]
+				if message.Role == "system" {
+					if message.Content == "" {
+						message.Content = req.SystemInstruction
+					} else {
+						message.Content = req.SystemInstruction + "\n\n" + message.Content
+					}
+					return messages
+				}
+			}
+			messages = append([]Message{{Role: "system", Content: req.SystemInstruction}}, messages...)
+		}
+		return messages
 	}
-	messages = append(messages, map[string]string{"role": "user", "content": req.Prompt})
+
+	messages := make([]Message, 0, 2)
+	if req.SystemInstruction != "" {
+		messages = append(messages, Message{Role: "system", Content: req.SystemInstruction})
+	}
+	if req.Prompt != "" {
+		messages = append(messages, Message{Role: "user", Content: req.Prompt})
+	}
 	return messages
+}
+
+func openAIMessages(req *GenerateRequest) []map[string]any {
+	messages := requestMessages(req)
+	encoded := make([]map[string]any, 0, len(messages))
+	for _, message := range messages {
+		item := map[string]any{"role": message.Role}
+		if message.Content != "" || len(message.ToolCalls) == 0 {
+			item["content"] = message.Content
+		}
+		if message.Role == "tool" {
+			item["tool_call_id"] = message.ToolCallID
+		}
+		if len(message.ToolCalls) > 0 {
+			calls := make([]map[string]any, 0, len(message.ToolCalls))
+			for _, call := range message.ToolCalls {
+				arguments := call.Arguments
+				if len(arguments) == 0 {
+					arguments = json.RawMessage("{}")
+				}
+				calls = append(calls, map[string]any{
+					"id":   call.ID,
+					"type": "function",
+					"function": map[string]any{
+						"name":      call.Name,
+						"arguments": string(arguments),
+					},
+				})
+			}
+			item["tool_calls"] = calls
+		}
+		encoded = append(encoded, item)
+	}
+	return encoded
+}
+
+func openAITools(tools []ToolDefinition) []map[string]any {
+	encoded := make([]map[string]any, 0, len(tools))
+	for _, tool := range tools {
+		parameters := tool.Parameters
+		if len(parameters) == 0 {
+			parameters = json.RawMessage(`{"type":"object","properties":{}}`)
+		}
+		encoded = append(encoded, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        tool.Name,
+				"description": tool.Description,
+				"parameters":  parameters,
+			},
+		})
+	}
+	return encoded
+}
+
+func anthropicMessages(req *GenerateRequest) (string, []map[string]any) {
+	messages := requestMessages(req)
+	var system strings.Builder
+	encoded := make([]map[string]any, 0, len(messages))
+	for i := 0; i < len(messages); {
+		message := messages[i]
+		switch message.Role {
+		case "system":
+			if system.Len() > 0 {
+				system.WriteString("\n\n")
+			}
+			system.WriteString(message.Content)
+			i++
+		case "tool":
+			// Anthropic represents tool output as a user message containing one or
+			// more tool_result blocks, rather than as a separate "tool" role.
+			blocks := make([]map[string]any, 0, 1)
+			for i < len(messages) && messages[i].Role == "tool" {
+				toolResult := messages[i]
+				blocks = append(blocks, map[string]any{
+					"type":        "tool_result",
+					"tool_use_id": toolResult.ToolCallID,
+					"content":     toolResult.Content,
+				})
+				i++
+			}
+			encoded = append(encoded, map[string]any{"role": "user", "content": blocks})
+		default:
+			blocks := make([]map[string]any, 0, 1+len(message.ToolCalls))
+			if message.Content != "" {
+				blocks = append(blocks, map[string]any{"type": "text", "text": message.Content})
+			}
+			for _, call := range message.ToolCalls {
+				input := call.Arguments
+				if len(input) == 0 {
+					input = json.RawMessage("{}")
+				}
+				blocks = append(blocks, map[string]any{
+					"type":  "tool_use",
+					"id":    call.ID,
+					"name":  call.Name,
+					"input": input,
+				})
+			}
+			if len(blocks) == 0 {
+				blocks = append(blocks, map[string]any{"type": "text", "text": ""})
+			}
+			encoded = append(encoded, map[string]any{"role": message.Role, "content": blocks})
+			i++
+		}
+	}
+	if system.Len() == 0 {
+		system.WriteString(req.SystemInstruction)
+	}
+	return system.String(), encoded
+}
+
+func anthropicTools(tools []ToolDefinition) []map[string]any {
+	encoded := make([]map[string]any, 0, len(tools))
+	for _, tool := range tools {
+		parameters := tool.Parameters
+		if len(parameters) == 0 {
+			parameters = json.RawMessage(`{"type":"object","properties":{}}`)
+		}
+		encoded = append(encoded, map[string]any{
+			"name":         tool.Name,
+			"description":  tool.Description,
+			"input_schema": parameters,
+		})
+	}
+	return encoded
 }
 
 func (c *Client) requestParameters() map[string]any {
@@ -281,7 +473,17 @@ func hasJSONValue(raw json.RawMessage) bool {
 	return len(raw) > 0 && !bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
 
-func endpointFor(cfg Config, protocol, path string) (string, error) {
+// EffectiveProtocol returns the wire protocol selected by this configuration.
+func (cfg Config) EffectiveProtocol() string {
+	return protocolFor(cfg.Provider, cfg.Protocol)
+}
+
+// EffectiveBaseURL returns the configured endpoint or the default for a known provider.
+func (cfg Config) EffectiveBaseURL() (string, error) {
+	return baseURLFor(cfg, cfg.EffectiveProtocol())
+}
+
+func baseURLFor(cfg Config, protocol string) (string, error) {
 	baseURL := strings.TrimRight(cfg.BaseURL, "/")
 	if baseURL == "" {
 		switch protocol {
@@ -310,6 +512,18 @@ func endpointFor(cfg Config, protocol, path string) (string, error) {
 	if parsed.User != nil {
 		return "", fmt.Errorf("baseURL must not contain embedded credentials; use secretKey")
 	}
+	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
+func endpointFor(cfg Config, protocol, path string) (string, error) {
+	baseURL, err := baseURLFor(cfg, protocol)
+	if err != nil {
+		return "", err
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid baseURL: expected an absolute HTTP(S) URL")
+	}
 	if !strings.HasSuffix(strings.TrimRight(parsed.Path, "/"), path) {
 		parsed.Path = strings.TrimRight(parsed.Path, "/") + path
 		parsed.RawPath = ""
@@ -322,41 +536,78 @@ func (c *Client) postJSON(ctx context.Context, protocol, endpoint string, payloa
 	if err != nil {
 		return nil, fmt.Errorf("encoding %s request: %w", c.cfg.Provider, err)
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("creating %s request for %s: %w", c.cfg.Provider, safeEndpoint(endpoint), err)
-	}
-	request.Header.Set("Content-Type", "application/json")
-	for name, value := range c.cfg.Headers {
-		request.Header.Set(name, value)
-	}
-	if protocol == ProtocolAnthropic && request.Header.Get("anthropic-version") == "" {
-		request.Header.Set("anthropic-version", "2023-06-01")
-	}
-	if c.cfg.APIKey != "" {
-		header, prefix := defaultAPIKeyAuth(protocol)
-		if c.cfg.APIKeyHeader != "" {
-			header = c.cfg.APIKeyHeader
-			prefix = ""
+	for attempt := 0; ; attempt++ {
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("creating %s request for %s: %w", c.cfg.Provider, safeEndpoint(endpoint), err)
 		}
-		if c.cfg.APIKeyPrefix != "" {
-			prefix = c.cfg.APIKeyPrefix
+		request.Header.Set("Content-Type", "application/json")
+		for name, value := range c.cfg.Headers {
+			request.Header.Set(name, value)
 		}
-		request.Header.Set(header, prefix+c.cfg.APIKey)
-	}
+		if protocol == ProtocolAnthropic && request.Header.Get("anthropic-version") == "" {
+			request.Header.Set("anthropic-version", "2023-06-01")
+		}
+		if c.cfg.APIKey != "" {
+			header, prefix := defaultAPIKeyAuth(protocol)
+			if c.cfg.APIKeyHeader != "" {
+				header = c.cfg.APIKeyHeader
+				prefix = ""
+			}
+			if c.cfg.APIKeyPrefix != "" {
+				prefix = c.cfg.APIKeyPrefix
+			}
+			request.Header.Set(header, prefix+c.cfg.APIKey)
+		}
 
-	// A network timeout can happen after a provider has already completed and
-	// billed the generation, so retries are left to the caller.
-	resp, err := c.httpClient.Do(request)
-	if err != nil {
-		return nil, fmt.Errorf("calling %s at %s: %w", c.cfg.Provider, safeEndpoint(endpoint), err)
+		resp, err := c.httpClient.Do(request)
+		if err != nil {
+			// A timeout can happen after the provider completed and billed a call.
+			// Don't replay requests when the outcome is ambiguous.
+			return nil, fmt.Errorf("calling %s at %s: %w", c.cfg.Provider, safeEndpoint(endpoint), err)
+		}
+		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+			return resp, nil
+		}
+
+		statusCode := resp.StatusCode
+		retryAfter := resp.Header.Get("Retry-After")
+		responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+		if attempt >= maxProviderRetries || !retryableStatus(statusCode) {
+			return nil, fmt.Errorf("%s request failed with status %d: %s", c.cfg.Provider, statusCode, strings.TrimSpace(string(responseBody)))
+		}
+		if err := waitForProviderRetry(ctx, retryAfter, attempt); err != nil {
+			return nil, fmt.Errorf("waiting to retry %s request: %w", c.cfg.Provider, err)
+		}
 	}
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("%s request failed with status %d: %s", c.cfg.Provider, resp.StatusCode, strings.TrimSpace(string(body)))
+}
+
+func retryableStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
+}
+
+func waitForProviderRetry(ctx context.Context, retryAfter string, attempt int) error {
+	delay := time.Duration(250*(1<<attempt)) * time.Millisecond
+	if seconds, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && seconds >= 0 {
+		delay = time.Duration(seconds) * time.Second
+	} else if when, err := http.ParseTime(retryAfter); err == nil {
+		delay = time.Until(when)
 	}
-	return resp, nil
+	if delay < 0 {
+		delay = 0
+	}
+	if delay > maxRetryDelay {
+		delay = maxRetryDelay
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func defaultAPIKeyAuth(protocol string) (header, prefix string) {
