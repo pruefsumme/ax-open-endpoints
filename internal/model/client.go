@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -38,6 +39,8 @@ import (
 // Default model settings.
 const (
 	ProviderGoogle    = "google"
+	ProviderAnthropic = "anthropic"
+	ProviderOpenAI    = "openai"
 	ProtocolOpenAI    = "openai"
 	ProtocolAnthropic = "anthropic"
 	ProtocolGoogle    = "google"
@@ -276,11 +279,20 @@ func NewClient(cfg Config, opts ...Option) *Client {
 	if cfg.Atespace == "" {
 		cfg.Atespace = DefaultAtespace
 	}
-	if cfg.Model == "" {
-		cfg.Model = DefaultModel
-	}
 	if cfg.Provider == "" {
-		cfg.Provider = ProviderGoogle
+		switch protocolFor(cfg.Provider, cfg.Protocol) {
+		case ProtocolGoogle:
+			cfg.Provider = ProviderGoogle
+		case ProtocolAnthropic:
+			cfg.Provider = ProviderAnthropic
+		case ProtocolOpenAI:
+			cfg.Provider = ProviderOpenAI
+		default:
+			cfg.Provider = cfg.Protocol
+		}
+	}
+	if cfg.Model == "" && protocolFor(cfg.Provider, cfg.Protocol) == ProtocolGoogle {
+		cfg.Model = DefaultModel
 	}
 	if cfg.SecretKey == nil && protocolFor(cfg.Provider, cfg.Protocol) == ProtocolGoogle {
 		cfg.SecretKey = &SecretKeyRef{
@@ -510,6 +522,9 @@ func (c *Client) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 		modelName = c.cfg.Model
 	}
 	if modelName == "" {
+		if protocolFor(c.cfg.Provider, c.cfg.Protocol) != ProtocolGoogle {
+			return nil, fmt.Errorf("model must be set for provider %q", c.cfg.Provider)
+		}
 		modelName = DefaultModel
 	}
 
@@ -528,16 +543,20 @@ func (c *Client) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 		MaxTokens:         req.MaxTokens,
 	}
 
-	provider := strings.ToLower(c.cfg.Provider)
-	if provider == "" || provider == ProviderGoogle {
-		return c.generateGoogle(ctx, effectiveReq)
-	}
-
 	if c.cfg.DisableRemote {
 		return c.fallbackResponse(effectiveReq), nil
 	}
 
-	return nil, fmt.Errorf("unsupported provider %q", c.cfg.Provider)
+	if protocolFor(c.cfg.Provider, c.cfg.Protocol) == ProtocolGoogle && c.cfg.APIKey == "" {
+		// Preserve the local no-key behavior used by the default workspace planner.
+		return c.fallbackResponse(effectiveReq), nil
+	}
+
+	adapter, err := adapterFor(protocolFor(c.cfg.Provider, c.cfg.Protocol))
+	if err != nil {
+		return nil, fmt.Errorf("provider %q: %w", c.cfg.Provider, err)
+	}
+	return adapter.Generate(ctx, c, effectiveReq)
 }
 
 // generateGoogle communicates with Google Generative Language API for Gemini models.
@@ -545,13 +564,28 @@ func (c *Client) generateGoogle(ctx context.Context, req *GenerateRequest) (*Gen
 	if c.cfg.DisableRemote || c.cfg.APIKey == "" {
 		return c.fallbackResponse(req), nil
 	}
-
-	baseURL := c.cfg.BaseURL
-	if baseURL == "" {
-		baseURL = "https://generativelanguage.googleapis.com"
+	if strings.ContainsAny(req.Model, "/?#") {
+		return nil, fmt.Errorf("Gemini model name must be a single path segment")
 	}
 
-	endpoint := fmt.Sprintf("%s/v1beta/models/%s:generateContent?key=%s", baseURL, req.Model, c.cfg.APIKey)
+	endpoint, err := endpointFor(c.cfg, ProtocolGoogle, "/v1beta/models/"+req.Model+":generateContent")
+	if err != nil {
+		return nil, err
+	}
+	endpointURL, err := url.Parse(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("parsing Gemini endpoint: %w", err)
+	}
+	if c.cfg.APIKeyHeader == "" {
+		// Keep Google's documented query-key form as the default. A custom key
+		// header is useful for gateways and keeps credentials out of request URLs.
+		query := endpointURL.Query()
+		query.Set("key", c.cfg.APIKey)
+		endpointURL.RawQuery = query.Encode()
+	}
+	endpoint = endpointURL.String()
+	safeEndpoint := *endpointURL
+	safeEndpoint.RawQuery = ""
 
 	payload := map[string]interface{}{
 		"contents": []map[string]interface{}{
@@ -598,18 +632,22 @@ func (c *Client) generateGoogle(ctx context.Context, req *GenerateRequest) (*Gen
 		return nil, fmt.Errorf("creating http request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	for name, value := range c.cfg.Headers {
+		httpReq.Header.Set(name, value)
+	}
+	if c.cfg.APIKeyHeader != "" {
+		prefix := c.cfg.APIKeyPrefix
+		httpReq.Header.Set(c.cfg.APIKeyHeader, prefix+c.cfg.APIKey)
+	}
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return c.fallbackResponse(req), nil
+		return nil, fmt.Errorf("calling Gemini at %s: %w", safeEndpoint.Redacted(), err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			return c.fallbackResponse(req), nil
-		}
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, fmt.Errorf("gemini api error %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 
