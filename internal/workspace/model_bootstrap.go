@@ -35,6 +35,7 @@ const (
 	maxBootstrapToolCalls   = 48
 	bootstrapCommandTimeout = 2 * time.Minute
 	maxBootstrapOutput      = 32 * 1024
+	maxBootstrapTranscript  = 128 * 1024
 	maxBootstrapCommandSize = 16 * 1024
 )
 
@@ -97,6 +98,7 @@ func runModelBootstrap(parent context.Context, goal, workspacePath string) bool 
 	}}
 
 	toolCalls := 0
+	transcriptBytes := 0
 	for turn := 0; turn < maxBootstrapTurns; turn++ {
 		response, err := client.Generate(ctx, &model.GenerateRequest{
 			Messages:  messages,
@@ -129,7 +131,17 @@ func runModelBootstrap(parent context.Context, goal, workspacePath string) bool 
 			if call.ID == "" {
 				call.ID = fmt.Sprintf("workspace-setup-%d", toolCalls)
 			}
-			result := executeWorkspaceCommand(ctx, workspacePath, call)
+			remaining := maxBootstrapTranscript - transcriptBytes
+			if remaining <= 0 {
+				slog.Warn("model-backed workspace bootstrap exceeded transcript limit", "limit", maxBootstrapTranscript)
+				return false
+			}
+			outputLimit := maxBootstrapOutput
+			if remaining < outputLimit {
+				outputLimit = remaining
+			}
+			result := executeWorkspaceCommand(ctx, workspacePath, call, outputLimit)
+			transcriptBytes += len(result)
 			messages = append(messages, model.Message{
 				Role:       "tool",
 				ToolCallID: call.ID,
@@ -143,7 +155,7 @@ func runModelBootstrap(parent context.Context, goal, workspacePath string) bool 
 	return false
 }
 
-func executeWorkspaceCommand(ctx context.Context, workspacePath string, call model.ToolCall) string {
+func executeWorkspaceCommand(ctx context.Context, workspacePath string, call model.ToolCall, outputLimit int) string {
 	if call.Name != "run_command" {
 		return fmt.Sprintf("unknown tool %q; use run_command", call.Name)
 	}
@@ -163,8 +175,10 @@ func executeWorkspaceCommand(ctx context.Context, workspacePath string, call mod
 	commandCtx, cancel := context.WithTimeout(ctx, bootstrapCommandTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(commandCtx, "/bin/sh", "-c", input.Command)
+	// This sets the working directory; it is not a filesystem jail. The task
+	// container remains the isolation boundary for commands requested by a model.
 	cmd.Dir = workspacePath
-	output := &limitedOutput{limit: maxBootstrapOutput}
+	output := &limitedOutput{limit: outputLimit}
 	cmd.Stdout = output
 	cmd.Stderr = output
 	if err := cmd.Run(); err != nil {
