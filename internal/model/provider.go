@@ -63,12 +63,15 @@ func (openAIAdapter) Generate(ctx context.Context, client *Client, req *Generate
 	moveParameter(parameters, "maxTokens", "max_tokens")
 	moveParameter(parameters, "maxOutputTokens", "max_tokens")
 	parameters["model"] = req.Model
-	parameters["messages"] = []map[string]string{{"role": "user", "content": req.Prompt}}
+	parameters["messages"] = promptMessages(req)
 	if req.Temperature > 0 {
 		parameters["temperature"] = req.Temperature
 	}
 	if req.MaxTokens > 0 {
 		parameters["max_tokens"] = req.MaxTokens
+	}
+	if err := rejectStreaming(parameters); err != nil {
+		return nil, err
 	}
 
 	resp, err := client.postJSON(ctx, ProtocolOpenAI, endpoint, parameters)
@@ -115,13 +118,17 @@ func (openAIAdapter) Generate(ctx context.Context, client *Client, req *Generate
 	if modelName == "" {
 		modelName = req.Model
 	}
+	totalTokens := completion.Usage.TotalTokens
+	if totalTokens == 0 {
+		totalTokens = completion.Usage.PromptTokens + completion.Usage.CompletionTokens
+	}
 	return &GenerateResponse{
 		Model:   modelName,
 		Content: content,
 		Usage: UsageStats{
 			PromptTokens:     completion.Usage.PromptTokens,
 			CompletionTokens: completion.Usage.CompletionTokens,
-			TotalTokens:      completion.Usage.TotalTokens,
+			TotalTokens:      totalTokens,
 		},
 	}, nil
 }
@@ -139,7 +146,7 @@ func (anthropicAdapter) Generate(ctx context.Context, client *Client, req *Gener
 	moveParameter(parameters, "maxTokens", "max_tokens")
 	moveParameter(parameters, "maxOutputTokens", "max_tokens")
 	parameters["model"] = req.Model
-	parameters["messages"] = promptMessages(req)
+	parameters["messages"] = []map[string]string{{"role": "user", "content": req.Prompt}}
 	if _, ok := parameters["max_tokens"]; !ok {
 		// Anthropic requires this field even when the caller leaves AX's cap unset.
 		parameters["max_tokens"] = 1024
@@ -152,6 +159,9 @@ func (anthropicAdapter) Generate(ctx context.Context, client *Client, req *Gener
 	}
 	if req.MaxTokens > 0 {
 		parameters["max_tokens"] = req.MaxTokens
+	}
+	if err := rejectStreaming(parameters); err != nil {
+		return nil, err
 	}
 
 	resp, err := client.postJSON(ctx, ProtocolAnthropic, endpoint, parameters)
@@ -183,6 +193,9 @@ func (anthropicAdapter) Generate(ctx context.Context, client *Client, req *Gener
 		}
 	}
 	if content.Len() == 0 {
+		if message.StopReason == "tool_use" {
+			return nil, fmt.Errorf("Anthropic returned tool use, but AX Generate only supports text responses")
+		}
 		return nil, fmt.Errorf("Anthropic returned no text content (stop reason %q)", message.StopReason)
 	}
 	modelName := message.Model
@@ -217,6 +230,13 @@ func (c *Client) requestParameters() map[string]any {
 		}
 	}
 	return parameters
+}
+
+func rejectStreaming(parameters map[string]any) error {
+	if streaming, ok := parameters["stream"].(bool); ok && streaming {
+		return fmt.Errorf("streaming is not supported by AX Generate")
+	}
+	return nil
 }
 
 func moveParameter(parameters map[string]any, from, to string) {
