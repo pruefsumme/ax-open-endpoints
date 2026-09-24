@@ -545,13 +545,17 @@ func (c *Client) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 	if req.Prompt == "" && len(req.Messages) == 0 {
 		return nil, fmt.Errorf("prompt or messages must be set")
 	}
+	protocol := protocolFor(c.cfg.Provider, c.cfg.Protocol)
+	if protocol == ProtocolGoogle && (len(req.Messages) > 0 || len(req.Tools) > 0) {
+		return nil, fmt.Errorf("native Google API does not use AX's OpenAI-style message and tool format; use protocol: openai for the Gemini compatibility endpoint")
+	}
 
 	modelName := req.Model
 	if modelName == "" {
 		modelName = c.cfg.Model
 	}
 	if modelName == "" {
-		if protocolFor(c.cfg.Provider, c.cfg.Protocol) != ProtocolGoogle {
+		if protocol != ProtocolGoogle {
 			return nil, fmt.Errorf("model must be set for provider %q", c.cfg.Provider)
 		}
 		modelName = DefaultModel
@@ -578,12 +582,12 @@ func (c *Client) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 		return c.fallbackResponse(effectiveReq), nil
 	}
 
-	if protocolFor(c.cfg.Provider, c.cfg.Protocol) == ProtocolGoogle && c.cfg.APIKey == "" {
+	if protocol == ProtocolGoogle && c.cfg.APIKey == "" {
 		// Preserve the local no-key behavior used by the default workspace planner.
 		return c.fallbackResponse(effectiveReq), nil
 	}
 
-	adapter, err := adapterFor(protocolFor(c.cfg.Provider, c.cfg.Protocol))
+	adapter, err := adapterFor(protocol)
 	if err != nil {
 		return nil, fmt.Errorf("provider %q: %w", c.cfg.Provider, err)
 	}
@@ -592,9 +596,6 @@ func (c *Client) Generate(ctx context.Context, req *GenerateRequest) (*GenerateR
 
 // generateGoogle communicates with Google Generative Language API for Gemini models.
 func (c *Client) generateGoogle(ctx context.Context, req *GenerateRequest) (*GenerateResponse, error) {
-	if len(req.Messages) > 0 || len(req.Tools) > 0 {
-		return nil, fmt.Errorf("native Google API does not use AX's OpenAI-style message and tool format; use protocol: openai for the Gemini compatibility endpoint")
-	}
 	if c.cfg.DisableRemote || c.cfg.APIKey == "" {
 		return c.fallbackResponse(req), nil
 	}
