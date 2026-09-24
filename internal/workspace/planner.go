@@ -64,7 +64,7 @@ func NewPlannerFromStore(ctx context.Context, s store.Store, atespace string, op
 }
 
 // PlanEnvironment analyzes the declared goal, workspace repositories, MCP servers,
-// and skills using Gemini 3.8 Flash to synthesize execution setup instructions.
+// and skills to synthesize execution setup instructions.
 func (p *Planner) PlanEnvironment(ctx context.Context, ws *v1alpha1.Workspace, goal string) (*EnvironmentPlan, error) {
 	if ws == nil {
 		return nil, fmt.Errorf("workspace cannot be nil")
@@ -91,8 +91,8 @@ func (p *Planner) PlanEnvironment(ctx context.Context, ws *v1alpha1.Workspace, g
 		mcpConfig != nil,
 	)
 
+	// Leave Model empty so Generate uses the model from its configured Model resource.
 	resp, err := p.client.Generate(ctx, &model.GenerateRequest{
-		Model:             model.DefaultModel, // gemini-3.8-flash
 		Prompt:            prompt,
 		SystemInstruction: "You are the AX system workspace environment planner. Output concise bootstrap plans for agent workspaces.",
 	})
