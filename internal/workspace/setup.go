@@ -46,6 +46,8 @@ const (
 	bootstrapScriptPath = "/usr/local/bin/antigravity_bootstrap.py"
 	// bootstrapAPIKeyEnv must be set for the Antigravity agent to run.
 	bootstrapAPIKeyEnv = "GEMINI_API_KEY"
+	modelConfigEnv     = "AX_MODEL_YAML"
+	modelAPIKeyEnv     = "AX_MODEL_API_KEY"
 	// bootstrapTimeoutEnv overrides the default bootstrap timeout with a Go duration string.
 	bootstrapTimeoutEnv = "AX_BOOTSTRAP_TIMEOUT"
 	// bootstrapDataDir, under AXDir, is where the agent keeps its own state so
@@ -69,14 +71,14 @@ type SetupResult struct {
 	ClonedRepos   []string
 	SkillsMounted string
 	IsMaidenRun   bool
-	// BootstrapRan reports whether the Antigravity agent ran to completion for the goal.
+	// BootstrapRan reports whether the configured goal bootstrap completed.
 	BootstrapRan bool
 }
 
 // SetupWorkspace prepares the workspace directory on its maiden run: it clones the
-// declared Git repositories, creates the skills path, and invokes the Antigravity
-// bootstrap when a goal is provided. A marker file under AXDir records a completed
-// maiden run so subsequent calls are no-ops.
+// declared Git repositories, creates the skills path, and runs the configured
+// goal bootstrap when a goal is provided. A marker file under AXDir records a
+// completed maiden run so subsequent calls are no-ops.
 //
 // Git failures are logged and recorded under AXDir but do not abort setup. The marker
 // is withheld in that case so the next start retries the clone.
@@ -114,7 +116,11 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 	}
 
 	if goal != "" {
+		modelBootstrap := modelBootstrapSelected()
 		res.BootstrapRan = runBootstrap(ctx, goal, targetPath)
+		if modelBootstrap && !res.BootstrapRan {
+			return res, fmt.Errorf("configured model bootstrap did not complete")
+		}
 	}
 
 	if !gitOK {
@@ -269,12 +275,18 @@ func setupSkills(skills *v1alpha1.SkillsConfig) string {
 	return skills.Path
 }
 
-// runBootstrap hands the goal to the Antigravity agent so it can prepare the workspace.
-// It reports whether the agent ran to completion. The agent needs the bootstrap script
-// installed and an API key in the environment; when either is missing the step is
-// skipped with a log line. Failures are logged and otherwise ignored so the task's own
-// command still starts.
+// runBootstrap uses the configured Model for non-Google providers and keeps the
+// existing Antigravity bootstrap for the default Google setup.
 func runBootstrap(ctx context.Context, goal, targetPath string) bool {
+	if modelBootstrapSelected() {
+		return runModelBootstrap(ctx, goal, targetPath)
+	}
+	return runAntigravityBootstrap(ctx, goal, targetPath)
+}
+
+// runAntigravityBootstrap preserves the existing Google workspace setup path.
+// Failures are logged and ignored so the task command can still start.
+func runAntigravityBootstrap(ctx context.Context, goal, targetPath string) bool {
 	if _, err := os.Stat(bootstrapScriptPath); err != nil {
 		slog.Info("Antigravity bootstrap script not installed; skipping", "script", bootstrapScriptPath)
 		return false

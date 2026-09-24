@@ -64,8 +64,8 @@ type TaskReconciler struct {
 	defaultTemplate         string
 	defaultTemplateAtespace string
 
-	// SecretResolver resolves the Gemini API key for task containers. It defaults
-	// to the Kubernetes secret lookup; tests replace it to avoid touching a cluster.
+	// SecretResolver resolves model API keys for task containers. It defaults to
+	// the Kubernetes secret lookup; tests replace it to avoid touching a cluster.
 	SecretResolver SecretResolver
 
 	// WorkspaceReadyTimeout bounds how long Reconcile waits for the actor's workspace
@@ -93,6 +93,16 @@ func NewTaskReconciler(client *substrate.Client, defaultTemplate, defaultTemplat
 
 // Reconcile handles the reconciliation loop for a single Task.
 func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, gateway *v1alpha1.Gateway, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error) {
+	return r.reconcile(ctx, task, gateway, nil, workspaces...)
+}
+
+// ReconcileWithModel also makes the atespace's default Model available inside
+// the task runner for workspace setup and user-supplied task commands.
+func (r *TaskReconciler) ReconcileWithModel(ctx context.Context, task *v1alpha1.Task, gateway *v1alpha1.Gateway, configuredModel *v1alpha1.Model, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error) {
+	return r.reconcile(ctx, task, gateway, configuredModel, workspaces...)
+}
+
+func (r *TaskReconciler) reconcile(ctx context.Context, task *v1alpha1.Task, gateway *v1alpha1.Gateway, configuredModel *v1alpha1.Model, workspaces ...*v1alpha1.Workspace) (*v1alpha1.Task, error) {
 	if task.Metadata == nil {
 		task.Metadata = &v1alpha1.ObjectMeta{}
 	}
@@ -150,7 +160,11 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, gat
 		}
 	}
 
-	if geminiKey := r.lookupGeminiKey(ctx, atespace); geminiKey != "" {
+	if configuredModel != nil {
+		if err := r.injectModelEnvironment(ctx, atespace, configuredModel, extraEnv); err != nil {
+			return task, fmt.Errorf("preparing model configuration for task runner: %w", err)
+		}
+	} else if geminiKey := r.lookupGeminiKey(ctx, atespace); geminiKey != "" {
 		extraEnv[geminiSecretKey] = geminiKey
 	}
 
@@ -387,6 +401,78 @@ func (r *TaskReconciler) lookupGeminiKey(ctx context.Context, atespace string) s
 		return key
 	}
 	return ""
+}
+
+func (r *TaskReconciler) injectModelEnvironment(ctx context.Context, atespace string, configured *v1alpha1.Model, env map[string]string) error {
+	modelYAML, err := yaml.Marshal(configured)
+	if err != nil {
+		return fmt.Errorf("marshaling Model resource: %w", err)
+	}
+	env["AX_MODEL_YAML"] = string(modelYAML)
+
+	cfg := model.ConfigFromCRD(configured)
+	protocol := cfg.EffectiveProtocol()
+	baseURL, err := cfg.EffectiveBaseURL()
+	if err != nil {
+		return err
+	}
+	env["AX_MODEL_PROVIDER"] = cfg.Provider
+	env["AX_MODEL_PROTOCOL"] = protocol
+	env["AX_MODEL"] = cfg.Model
+	env["AX_MODEL_BASE_URL"] = baseURL
+
+	apiKey := r.lookupModelAPIKey(ctx, atespace, cfg)
+	if apiKey != "" {
+		env["AX_MODEL_API_KEY"] = apiKey
+		switch protocol {
+		case model.ProtocolOpenAI:
+			env["OPENAI_API_KEY"] = apiKey
+			env["OPENAI_MODEL"] = cfg.Model
+			env["OPENAI_BASE_URL"] = baseURL
+		case model.ProtocolAnthropic:
+			env["ANTHROPIC_API_KEY"] = apiKey
+			env["ANTHROPIC_MODEL"] = cfg.Model
+			env["ANTHROPIC_BASE_URL"] = baseURL
+		case model.ProtocolGoogle:
+			env[geminiSecretKey] = apiKey
+			env["GEMINI_MODEL"] = cfg.Model
+		}
+	}
+	return nil
+}
+
+func (r *TaskReconciler) lookupModelAPIKey(ctx context.Context, atespace string, cfg model.Config) string {
+	if cfg.SecretKey != nil && r.SecretResolver != nil {
+		lookupCtx, cancel := context.WithTimeout(ctx, secretLookupTimeout)
+		key, err := r.SecretResolver(lookupCtx, atespace, cfg.SecretKey.Name, cfg.SecretKey.Key)
+		cancel()
+		if err == nil && key != "" {
+			return key
+		}
+		if err != nil {
+			slog.Warn("could not resolve Model API key", "atespace", atespace, "secret", cfg.SecretKey.Name, "error", err)
+		}
+	}
+
+	for _, name := range modelAPIKeyEnvironmentNames(cfg.EffectiveProtocol()) {
+		if key := os.Getenv(name); key != "" {
+			return key
+		}
+	}
+	return ""
+}
+
+func modelAPIKeyEnvironmentNames(protocol string) []string {
+	switch protocol {
+	case model.ProtocolOpenAI:
+		return []string{"OPENAI_API_KEY", "AX_MODEL_API_KEY"}
+	case model.ProtocolAnthropic:
+		return []string{"ANTHROPIC_API_KEY", "AX_MODEL_API_KEY"}
+	case model.ProtocolGoogle:
+		return []string{geminiSecretKey, "AX_MODEL_API_KEY"}
+	default:
+		return []string{"AX_MODEL_API_KEY"}
+	}
 }
 
 // taskTemplateName derives the per-task ActorTemplate name from the task name and a

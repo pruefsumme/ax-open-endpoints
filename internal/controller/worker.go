@@ -22,6 +22,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/google/ax/internal/model"
 	"github.com/google/ax/internal/store"
 	"github.com/google/ax/pkg/apis/v1alpha1"
 )
@@ -152,7 +153,15 @@ func (w *Worker) processEvent(ctx context.Context, ev store.TaskEvent) error {
 		}
 	}
 
-	reconciled, err := w.reconciler.Reconcile(ctx, task, gw, workspaces...)
+	var configuredModel *v1alpha1.Model
+	configuredModel, err = w.store.GetModel(ctx, task.Metadata.Atespace, model.DefaultModelResourceName)
+	if errors.Is(err, store.ErrNotFound) {
+		configuredModel = nil
+	} else if err != nil {
+		return fmt.Errorf("fetching default Model for task %s/%s: %w", task.Metadata.Atespace, task.Metadata.Name, err)
+	}
+
+	reconciled, err := w.reconciler.ReconcileWithModel(ctx, task, gw, configuredModel, workspaces...)
 	if err != nil {
 		task.Status.Phase = "Failed"
 		_ = w.store.UpdateTaskStatus(ctx, task.Metadata.Atespace, task.Metadata.Name, task.Status)
