@@ -38,6 +38,6 @@ Network boundary for a task. Declares listeners the task exposes and an **egress
 
 ## Model
 
-A `Model` is not a model. It is a named model configuration: which provider to call, which model identifier to use, provider-specific generation parameters such as temperature, and a reference to the Kubernetes secret holding the API key.
+A `Model` is a named model configuration: which provider and API protocol to call, which model identifier to use, provider-specific generation parameters such as temperature, an optional API base URL and headers, and a reference to the Kubernetes secret holding the API key. OpenAI-compatible providers can be selected by configuration; Google Gemini and Anthropic use native adapters.
 
 Declaring it as a resource is what makes it manageable across the cluster. The configuration lives in one place instead of in every agent's environment, so rotating a key, pinning a new model version, or tightening a parameter is one `ax apply` rather than a hunt through task definitions. AX's own components read it too, for example when planning a workspace from a goal.
