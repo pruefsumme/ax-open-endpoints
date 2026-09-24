@@ -421,21 +421,27 @@ func (r *TaskReconciler) injectModelEnvironment(ctx context.Context, atespace st
 	env["AX_MODEL"] = cfg.Model
 	env["AX_MODEL_BASE_URL"] = baseURL
 
+	switch protocol {
+	case model.ProtocolOpenAI:
+		env["OPENAI_MODEL"] = cfg.Model
+		env["OPENAI_BASE_URL"] = baseURL
+	case model.ProtocolAnthropic:
+		env["ANTHROPIC_MODEL"] = cfg.Model
+		env["ANTHROPIC_BASE_URL"] = baseURL
+	case model.ProtocolGoogle:
+		env["GEMINI_MODEL"] = cfg.Model
+	}
+
 	apiKey := r.lookupModelAPIKey(ctx, atespace, cfg)
 	if apiKey != "" {
 		env["AX_MODEL_API_KEY"] = apiKey
 		switch protocol {
 		case model.ProtocolOpenAI:
 			env["OPENAI_API_KEY"] = apiKey
-			env["OPENAI_MODEL"] = cfg.Model
-			env["OPENAI_BASE_URL"] = baseURL
 		case model.ProtocolAnthropic:
 			env["ANTHROPIC_API_KEY"] = apiKey
-			env["ANTHROPIC_MODEL"] = cfg.Model
-			env["ANTHROPIC_BASE_URL"] = baseURL
 		case model.ProtocolGoogle:
 			env[geminiSecretKey] = apiKey
-			env["GEMINI_MODEL"] = cfg.Model
 		}
 	}
 	return nil
